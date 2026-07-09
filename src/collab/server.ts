@@ -309,7 +309,11 @@ export function createServer() {
     // module owns the idle timer / min-interval fallback / Redis dedup. Gated
     // behind AUTO_SNAPSHOT_ENABLED (default off) inside the module.
     async afterStoreDocument(data) {
-      await handleAfterStore(data.documentName, data.lastContext as AuthContext | undefined)
+      await handleAfterStore(
+        data.documentName,
+        data.lastContext as AuthContext | undefined,
+        data.document,
+      )
     },
 
     // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer
@@ -320,7 +324,7 @@ export function createServer() {
         dispose()
         repairDisposers.delete(data.documentName)
       }
-      await handleBeforeUnload(data.documentName)
+      await handleBeforeUnload(data.documentName, data.document)
     },
   })
 

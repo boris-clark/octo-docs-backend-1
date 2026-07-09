@@ -19,6 +19,13 @@ vi.mock('../src/collab/liveRestore.js', () => ({
   applyRestoreToLiveDoc: vi.fn(async () => {}),
   applyBoardRestoreToLiveDoc: vi.fn(async () => {}),
 }))
+// createVersionHandler snapshots the CURRENT live authoritative state via
+// readLiveDocState (openDirectConnection under the hood). Mock that seam so the
+// handler is unit-testable without a running collab server; default to an empty
+// Yjs update (a doc with no edits yet).
+vi.mock('../src/collab/liveDocRead.js', () => ({
+  readLiveDocState: vi.fn(async () => new Uint8Array([0, 0])),
+}))
 
 import {
   listVersionsHandler,
@@ -36,7 +43,7 @@ import {
   KIND_RESTORE_MARKER,
 } from '../src/db/repos/docVersionRepo.js'
 import { restoreVersion } from '../src/api/services/restoreVersion.js'
-import { persistence } from '../src/collab/persistence.js'
+import { readLiveDocState } from '../src/collab/liveDocRead.js'
 import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../src/collab/liveRestore.js'
 import { query, transaction } from '../src/db/pool.js'
 import {
@@ -276,7 +283,7 @@ describe('version wire contract (serialized field names)', () => {
 
   it('create reads the label from req.body.label and returns docVersionSeq', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
-    vi.spyOn(persistence, 'fetch').mockResolvedValue(null)
+    vi.mocked(readLiveDocState).mockResolvedValue(new Uint8Array([0, 0]))
     const createSpy = vi.spyOn(docVersionRepo, 'create').mockResolvedValue(7)
 
     const res = mockRes()
@@ -287,7 +294,6 @@ describe('version wire contract (serialized field names)', () => {
     expect(createSpy.mock.calls[0]![0].name).toBe('Named A')
 
     createSpy.mockRestore()
-    vi.mocked(persistence.fetch).mockRestore()
   })
 
   it('restore response uses restoredFrom and newDocVersionSeq (end-to-end through the handler)', async () => {
@@ -1085,7 +1091,7 @@ describe('version routes — whiteboard (Excalidraw scene) path', () => {
 
   it('createVersionHandler snapshots a board and stamps WB_SCHEMA_VERSION', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
-    vi.spyOn(persistence, 'fetch').mockResolvedValue(stateFromBoard([rect('e1', 'a0')]))
+    vi.mocked(readLiveDocState).mockResolvedValue(stateFromBoard([rect('e1', 'a0')]))
     const createSpy = vi.spyOn(docVersionRepo, 'create').mockResolvedValue(42)
 
     const res = mockRes()
@@ -1096,9 +1102,12 @@ describe('version routes — whiteboard (Excalidraw scene) path', () => {
     // The board version row is stamped on the whiteboard schema line, NOT the PM
     // SCHEMA_VERSION — that is what lets the reader pick the right decoder later.
     expect(createSpy.mock.calls[0]![0].schemaVersion).toBe(WB_SCHEMA_VERSION)
+    // The captured snapshot is the LIVE scene, not an empty payload, and it
+    // round-trips back to the drawn element (XIN-656).
+    const boardScene = decodeBoardSnapshot(createSpy.mock.calls[0]![0].state)
+    expect(boardScene.elements.map((e) => e.id)).toEqual(['e1'])
 
     createSpy.mockRestore()
-    vi.mocked(persistence.fetch).mockRestore()
   })
 
   it('listVersionsHandler returns board versions (list is never gated by kind)', async () => {
@@ -1249,7 +1258,7 @@ describe('version routes — whiteboard (Excalidraw scene) path', () => {
       meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', permission_epoch: 7 },
       role: 'admin',
     } as never)
-    vi.spyOn(persistence, 'fetch').mockResolvedValue(null)
+    vi.mocked(readLiveDocState).mockResolvedValue(new Uint8Array([0, 0]))
     const createSpy = vi.spyOn(docVersionRepo, 'create').mockResolvedValue(7)
 
     const res = mockRes()
@@ -1259,7 +1268,6 @@ describe('version routes — whiteboard (Excalidraw scene) path', () => {
     expect(createSpy.mock.calls[0]![0].schemaVersion).toBe(SCHEMA_VERSION)
 
     createSpy.mockRestore()
-    vi.mocked(persistence.fetch).mockRestore()
   })
 })
 

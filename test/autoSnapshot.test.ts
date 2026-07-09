@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import * as Y from 'yjs'
 
 // Offline unit test for the A4 auto-snapshot trigger logic. We mock the config
 // (so the feature gate / thresholds are controllable), the Redis dedup lock,
-// the live-state fetch, and the doc_version repo. The pruning SQL itself is
-// covered separately in docVersionPrune.test.ts against the mocked pool.
+// and the doc_version repo. The snapshot payload is encoded from the live Y.Doc
+// the hook hands in. The pruning SQL itself is covered separately in
+// docVersionPrune.test.ts against the mocked pool.
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
     autoSnapshot: {
@@ -20,9 +22,6 @@ vi.mock('../src/config/env.js', () => ({ config: mockConfig }))
 vi.mock('../src/db/redis.js', () => ({
   acquireLock: vi.fn(async () => true),
   rkey: (...parts: string[]) => ['octo-docs', ...parts].join(':'),
-}))
-vi.mock('../src/collab/persistence.js', () => ({
-  persistence: { fetch: vi.fn(async () => null) },
 }))
 vi.mock('../src/db/repos/docVersionRepo.js', () => ({
   docVersionRepo: { createAutoWithPrune: vi.fn(async () => 1) },
@@ -41,6 +40,8 @@ import { WB_SCHEMA_VERSION } from '../src/whiteboard/schema/index.js'
 
 const DOC = 'octo:s1:f1:d1'
 const ctx = (id: string) => ({ user: { id } }) as never
+/** A fresh live Y.Doc stand-in for the one the store/unload hook hands in. */
+const liveDoc = () => new Y.Doc()
 
 const createAuto = vi.mocked(docVersionRepo.createAutoWithPrune)
 
@@ -65,7 +66,7 @@ afterEach(() => {
 describe('idle trigger', () => {
   it('fires a single auto snapshot after the idle window with no new store', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     // nothing yet: min-interval not due (0-0<60s), idle timer pending.
     expect(createAuto).not.toHaveBeenCalled()
 
@@ -81,9 +82,9 @@ describe('idle trigger', () => {
 
   it('only the latest stop snapshots when stores keep coming (timer re-armed)', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     vi.setSystemTime(10_000)
-    await handleAfterStore(DOC, ctx('u_w')) // clears the first timer, re-arms @25s
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc()) // clears the first timer, re-arms @25s
     // advance only to 24s: the first (cleared) timer's slot passes, nothing fires.
     await vi.advanceTimersByTimeAsync(14_000)
     expect(createAuto).not.toHaveBeenCalled()
@@ -94,7 +95,7 @@ describe('idle trigger', () => {
 
   it('uses the short idle dedup key', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     await vi.advanceTimersByTimeAsync(15_000)
     expect(acquireLock).toHaveBeenCalledWith('octo-docs:autosnap:idle:' + DOC, 15_000)
   })
@@ -102,7 +103,7 @@ describe('idle trigger', () => {
   it('skips the idle frame when the Redis idle lock is already held', async () => {
     vi.mocked(acquireLock).mockResolvedValue(false)
     vi.setSystemTime(0)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).not.toHaveBeenCalled()
   })
@@ -116,7 +117,7 @@ describe('min-interval fallback', () => {
     // 60s -> exactly two min-interval frames (t and t+60s).
     for (let i = 0; i <= 6; i++) {
       vi.setSystemTime(base + i * 10_000)
-      await handleAfterStore(DOC, ctx('u_w'))
+      await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     }
     expect(createAuto).toHaveBeenCalledTimes(2)
     expect(acquireLock).toHaveBeenCalledWith('octo-docs:autosnap:mininterval:' + DOC, 60_000)
@@ -125,7 +126,7 @@ describe('min-interval fallback', () => {
   it('skips the min-interval frame when its Redis lock is already held', async () => {
     vi.mocked(acquireLock).mockResolvedValue(false)
     vi.setSystemTime(1_000_000)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     expect(createAuto).not.toHaveBeenCalled()
   })
 })
@@ -135,9 +136,9 @@ describe('AUTO_SNAPSHOT_ENABLED gate', () => {
   it('produces zero auto rows when disabled', async () => {
     mockConfig.autoSnapshot.enabled = false
     vi.setSystemTime(1_000_000)
-    await handleAfterStore(DOC, ctx('u_w'))
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc())
     await vi.advanceTimersByTimeAsync(120_000)
-    await handleBeforeUnload(DOC)
+    await handleBeforeUnload(DOC, liveDoc())
     expect(createAuto).not.toHaveBeenCalled()
     expect(acquireLock).not.toHaveBeenCalled()
   })
@@ -147,9 +148,9 @@ describe('AUTO_SNAPSHOT_ENABLED gate', () => {
 describe('unload', () => {
   it('flushes a final frame when there are edits since the last auto', async () => {
     vi.setSystemTime(5_000)
-    await handleAfterStore(DOC, ctx('u_w')) // lastStore=5000 > lastAuto=0, no min-interval
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc()) // lastStore=5000 > lastAuto=0, no min-interval
     expect(createAuto).not.toHaveBeenCalled()
-    await handleBeforeUnload(DOC)
+    await handleBeforeUnload(DOC, liveDoc())
     expect(createAuto).toHaveBeenCalledTimes(1)
     // the idle timer was cleared and per-doc state dropped: time passing is inert.
     await vi.advanceTimersByTimeAsync(120_000)
@@ -158,14 +159,14 @@ describe('unload', () => {
 
   it('does not flush when no edits happened since the last auto', async () => {
     vi.setSystemTime(1_000_000)
-    await handleAfterStore(DOC, ctx('u_w')) // min-interval frame -> lastAuto == lastStore
+    await handleAfterStore(DOC, ctx('u_w'), liveDoc()) // min-interval frame -> lastAuto == lastStore
     expect(createAuto).toHaveBeenCalledTimes(1)
-    await handleBeforeUnload(DOC)
+    await handleBeforeUnload(DOC, liveDoc())
     expect(createAuto).toHaveBeenCalledTimes(1) // no extra flush
   })
 
   it('is a no-op for an unknown / already-unloaded document', async () => {
-    await handleBeforeUnload('octo:s1:f1:dX')
+    await handleBeforeUnload('octo:s1:f1:dX', liveDoc())
     expect(createAuto).not.toHaveBeenCalled()
   })
 })
@@ -174,7 +175,7 @@ describe('unload', () => {
 describe('docId derivation', () => {
   it('snapshots whiteboard keys, deriving docId from the board segment (XIN-26 item 5)', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore('octo:s1:f1:wb:b1', ctx('u_w')) // whiteboard key
+    await handleAfterStore('octo:s1:f1:wb:b1', ctx('u_w'), liveDoc()) // whiteboard key
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).toHaveBeenCalled()
     // Board snapshots stamp the whiteboard schema line (WB_SCHEMA_VERSION),
@@ -188,7 +189,7 @@ describe('docId derivation', () => {
 
   it('stamps the ProseMirror SCHEMA_VERSION on a rich-text doc snapshot (§11.5 isolation)', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore('octo:s1:f1:d1', ctx('u_d')) // 4-seg document key
+    await handleAfterStore('octo:s1:f1:d1', ctx('u_d'), liveDoc()) // 4-seg document key
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).toHaveBeenCalled()
     expect(createAuto.mock.calls[0]![0]).toMatchObject({ docId: 'd1', schemaVersion: SCHEMA_VERSION })
@@ -198,7 +199,7 @@ describe('docId derivation', () => {
 
   it('skips a malformed key that parses to neither a document nor a whiteboard', async () => {
     vi.setSystemTime(0)
-    await handleAfterStore('not-an-octo-key', ctx('u_w'))
+    await handleAfterStore('not-an-octo-key', ctx('u_w'), liveDoc())
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).not.toHaveBeenCalled()
   })

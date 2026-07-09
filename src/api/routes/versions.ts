@@ -25,10 +25,9 @@
  * state is recorded first so the restore is itself undoable.
  */
 import { Router, type Request, type Response } from 'express'
-import * as Y from 'yjs'
 import { requireDocRole } from '../guard.js'
 import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
-import { persistence } from '../../collab/persistence.js'
+import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { restoreVersion } from '../services/restoreVersion.js'
 import {
   gateSchemaForKind,
@@ -152,10 +151,15 @@ export async function createVersionHandler(req: Request, res: Response): Promise
   }
 
   const documentName = guard.meta.document_name
-  // Snapshot the CURRENT live authoritative state. A doc with no edits yet has
-  // no yjs_document row; snapshot an empty Y.Doc so the column stays NOT NULL.
-  const live = await persistence.fetch(documentName)
-  const state = live ?? Y.encodeStateAsUpdate(new Y.Doc())
+  // Snapshot the CURRENT live authoritative state — the in-memory board/doc the
+  // user is editing, read via the live connection (readLiveDocState), NOT the
+  // persisted yjs_document row. The store is debounced, so a board drawn and
+  // then immediately versioned still had its Excalidraw scene only in the live
+  // doc; reading the row (persistence.fetch) captured a stale ~2-byte empty
+  // payload (XIN-656). openDirectConnection hydrates from persistence when the
+  // doc is not loaded, so a doc with no edits yet reads back an empty Y.Doc and
+  // the column stays NOT NULL.
+  const state = await readLiveDocState(documentName)
 
   const id = await docVersionRepo.create({
     docId: guard.meta.doc_id,
