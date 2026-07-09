@@ -27,7 +27,7 @@
  */
 import type { Document } from '@hocuspocus/server'
 import { getCollabServer } from './server.js'
-import { decodeTargetSnapshot, reconcileFragment, reconcileSheetMap } from './versionRestore.js'
+import { decodeTargetSnapshot, reconcileFragment, reconcileSheetMap, reconcileBoardMaps } from './versionRestore.js'
 import { COLLAB_FIELD } from '../schema/index.js'
 
 /**
@@ -64,6 +64,38 @@ export async function applyRestoreToLiveDoc(
     })
   } finally {
     // Flushes the final store (awaited) and releases the direct connection.
+    await connection.disconnect()
+  }
+}
+
+/**
+ * Board (Excalidraw scene) counterpart of applyRestoreToLiveDoc (delta #2).
+ *
+ * Applies a board version's ELEMENTS_FIELD / FILES_FIELD scene onto the live
+ * whiteboard document and broadcasts it, exactly like the ProseMirror path: the
+ * reconcile issues real Yjs deletes/inserts on the SAME in-memory Y.Doc the
+ * connected boards are editing (openDirectConnection), so deletions become
+ * causal tombstones every client converges to and the live doc's next store stays
+ * on the union-safe direction — no transient-doc write that would diverge by
+ * clientId and force the union fallback. The server-authoritative repair observer
+ * already attached to the live board (server.ts afterLoadDocument) normalizes the
+ * reconciled elements under REPAIR_ORIGIN, so a restored scene lands canonical.
+ *
+ * openDirectConnection bypasses onAuthenticate, so the caller (restoreVersion)
+ * MUST already have rechecked admin + permission_epoch under the row lock.
+ */
+export async function applyBoardRestoreToLiveDoc(
+  documentName: string,
+  uid: string,
+  targetState: Uint8Array,
+): Promise<void> {
+  const server = getCollabServer()
+  const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
+  try {
+    await connection.transact((doc: Document) => {
+      reconcileBoardMaps(doc, targetState)
+    })
+  } finally {
     await connection.disconnect()
   }
 }

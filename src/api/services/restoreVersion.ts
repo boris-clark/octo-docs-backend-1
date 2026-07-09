@@ -26,9 +26,16 @@ import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
-import { restoreReconcile, gateSchema, SchemaIncompatibleError, SheetSnapshotInvalidError } from '../../collab/versionRestore.js'
-import { applyRestoreToLiveDoc } from '../../collab/liveRestore.js'
-import { SCHEMA_VERSION } from '../../schema/index.js'
+import {
+  restoreReconcile,
+  restoreReconcileBoard,
+  gateSchemaForKind,
+  currentSchemaVersionFor,
+  SchemaIncompatibleError,
+  SheetSnapshotInvalidError,
+  type VersionContentKind,
+} from '../../collab/versionRestore.js'
+import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../../collab/liveRestore.js'
 import { config } from '../../config/env.js'
 import { roleAtLeast } from '../../permission/role.js'
 import * as Y from 'yjs'
@@ -44,6 +51,14 @@ export interface RestoreInput {
   versionId: number
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
+  /**
+   * Content kind of the doc being restored (delta #4), derived from
+   * `doc_meta.doc_type`. Selects the schema line to gate/stamp against and the
+   * decode/reconcile/live-apply path — `board` restores an Excalidraw scene,
+   * `document` restores a ProseMirror/spreadsheet Y.Doc. Defaults to `document`
+   * so existing callers/tests are unaffected.
+   */
+  contentKind?: VersionContentKind
 }
 
 interface LockedMetaRow {
@@ -60,13 +75,16 @@ async function isAdminTx(tx: Tx, docId: string, uid: string, ownerId: string): P
 }
 
 export async function restoreVersion(input: RestoreInput): Promise<RestoreResult> {
+  const kind: VersionContentKind = input.contentKind ?? 'document'
   // Load the target version (immutable) up front so the schema "newer" gate can
   // fail fast without taking any lock. Cross-doc ids are hidden behind 404.
   const target = await docVersionRepo.getStateById(input.versionId)
   if (!target || target.version.docId !== input.docId) {
     return { ok: false, status: 404, error: 'not_found' }
   }
-  const gate = gateSchema(target.version.schemaVersion, SCHEMA_VERSION)
+  // Kind-aware gate (delta #3): a board blob gates on WB_SCHEMA_VERSION, a
+  // document/sheet blob on the ProseMirror SCHEMA_VERSION.
+  const gate = gateSchemaForKind(target.version.schemaVersion, kind)
   if (!gate.ok) {
     return { ok: false, status: gate.status, error: gate.code }
   }
@@ -104,7 +122,9 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     //    diverge by clientId and force the union fallback in persistence.store.
     let validated: Uint8Array
     try {
-      validated = restoreReconcile(currentState, target.state)
+      validated = kind === 'board'
+        ? restoreReconcileBoard(currentState, target.state)
+        : restoreReconcile(currentState, target.state)
     } catch (err) {
       if (err instanceof SchemaIncompatibleError) {
         return { ok: false as const, status: 409, error: 'version_schema_incompatible' }
@@ -122,7 +142,9 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     }
 
     // 6. Auto safety snapshot of the CURRENT live state (undo for the restore),
-    //    recorded only after the reconcile + size check have passed.
+    //    recorded only after the reconcile + size check have passed. Stamp the
+    //    schema line that matches this doc's kind (delta #3/#4) so the safety
+    //    row itself decodes correctly on a later preview/restore.
     const safetyState = currentState ?? Y.encodeStateAsUpdate(new Y.Doc())
     const safetyVersionId = await docVersionRepo.createTx(tx, {
       docId: input.docId,
@@ -131,7 +153,7 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       name: 'Auto-safety before restore',
       restoredFrom: input.versionId,
       state: safetyState,
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: currentSchemaVersionFor(kind),
       createdBy: input.uid,
     })
 
@@ -153,8 +175,13 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
   //    real Yjs deletes on the live struct store (so deletions converge to every
   //    tab and are NOT resurrected by a stale client's union) and durably
   //    persists via the awaited store flush on disconnect. extension-redis
-  //    propagates the same update to other nodes that have the doc loaded.
-  await applyRestoreToLiveDoc(input.documentName, input.uid, target.state)
+  //    propagates the same update to other nodes that have the doc loaded. Board
+  //    docs take the Excalidraw-scene apply, documents/sheets the ProseMirror one.
+  if (kind === 'board') {
+    await applyBoardRestoreToLiveDoc(input.documentName, input.uid, target.state)
+  } else {
+    await applyRestoreToLiveDoc(input.documentName, input.uid, target.state)
+  }
 
   return { ok: true, restoredFrom: txResult.restoredFrom, newDocVersionSeq: txResult.newDocVersionSeq }
 }

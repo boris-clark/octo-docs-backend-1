@@ -17,6 +17,7 @@ vi.mock('../src/db/pool.js', () => ({
 // without a running collab server.
 vi.mock('../src/collab/liveRestore.js', () => ({
   applyRestoreToLiveDoc: vi.fn(async () => {}),
+  applyBoardRestoreToLiveDoc: vi.fn(async () => {}),
 }))
 
 import {
@@ -36,15 +37,21 @@ import {
 } from '../src/db/repos/docVersionRepo.js'
 import { restoreVersion } from '../src/api/services/restoreVersion.js'
 import { persistence } from '../src/collab/persistence.js'
-import { applyRestoreToLiveDoc } from '../src/collab/liveRestore.js'
+import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../src/collab/liveRestore.js'
 import { query, transaction } from '../src/db/pool.js'
 import {
   gateSchema,
+  gateSchemaForKind,
   restoreReconcile,
+  restoreReconcileBoard,
+  decodeBoardSnapshot,
+  contentKindFromDocType,
+  currentSchemaVersionFor,
   SchemaIncompatibleError,
 } from '../src/collab/versionRestore.js'
 import { computeFinalState } from '../src/collab/persistence.js'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../src/schema/index.js'
+import { WB_SCHEMA_VERSION } from '../src/whiteboard/schema/index.js'
 import { Node as PMNode } from 'prosemirror-model'
 import { prosemirrorToYDoc, prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 
@@ -101,6 +108,32 @@ function stateFromPM(pmJSON: unknown): Uint8Array {
   return Y.encodeStateAsUpdate(doc)
 }
 
+/**
+ * Build a Yjs state for a whiteboard snapshot: the ELEMENTS_FIELD / FILES_FIELD
+ * maps keyed by id, each value a per-entry Y.Map (matches whiteboard/ydoc.ts).
+ */
+function stateFromBoard(
+  elements: Array<Record<string, unknown>>,
+  files: Record<string, Record<string, unknown>> = {},
+): Uint8Array {
+  const doc = new Y.Doc()
+  const elMap = doc.getMap('elements')
+  const fMap = doc.getMap('files')
+  doc.transact(() => {
+    for (const el of elements) {
+      const y = new Y.Map<unknown>()
+      for (const [k, v] of Object.entries(el)) y.set(k, v)
+      elMap.set(el.id as string, y)
+    }
+    for (const [fid, f] of Object.entries(files)) {
+      const y = new Y.Map<unknown>()
+      for (const [k, v] of Object.entries(f)) y.set(k, v)
+      fMap.set(fid, y)
+    }
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
 function para(text: string) {
   return { type: 'paragraph', content: [{ type: 'text', text }] }
 }
@@ -118,6 +151,8 @@ beforeEach(() => {
   vi.mocked(transaction).mockReset()
   vi.mocked(applyRestoreToLiveDoc).mockReset()
   vi.mocked(applyRestoreToLiveDoc).mockResolvedValue(undefined)
+  vi.mocked(applyBoardRestoreToLiveDoc).mockReset()
+  vi.mocked(applyBoardRestoreToLiveDoc).mockResolvedValue(undefined)
 })
 
 // ── role gating: the min-role chosen per endpoint ─────────────────────────────
@@ -1020,14 +1055,12 @@ describe('listVersionsHandler — kind param + counts response', () => {
   })
 })
 
-// ── whiteboard doc_type gate: create/preview/restore reject boards (§11.5/§11.6) ─
-// Whiteboard rows share the doc_version table (schema_version=2) but must not
-// flow through the ProseMirror version path: gateSchema(2, 15) never trips, so
-// without a doc_type guard a board blob would preview as 200 + silently-empty
-// rich text, restore would stamp a mis-schema safety snapshot on the board row
-// and fire a spurious no-op write/broadcast on the live board. All three routes
-// reject a board up front with a fast 409, doing NO decode and NO DB/live write.
-describe('version routes — whiteboard doc_type gate', () => {
+// ── whiteboard version path: board list/create/preview/restore are ungated ────
+// The old 409 board gate (§11.6 deferred board version UI) is removed. Boards now
+// share the version routes with documents, but each request decodes/gates/restores
+// against its OWN schema line (delta #1-#4): a board stamps/gates WB_SCHEMA_VERSION
+// and decodes to an Excalidraw scene, never through the ProseMirror decoder.
+describe('version routes — whiteboard (Excalidraw scene) path', () => {
   const boardGuard = {
     meta: {
       doc_id: 'b_1',
@@ -1038,59 +1071,180 @@ describe('version routes — whiteboard doc_type gate', () => {
     role: 'admin',
   } as never
 
-  it('createVersionHandler rejects a board with 409 and writes no version row', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
-    const fetchSpy = vi.spyOn(persistence, 'fetch')
-    const createSpy = vi.spyOn(docVersionRepo, 'create')
-
-    const res = mockRes()
-    await createVersionHandler(req({ docId: 'b_1' }, { body: { label: 'x' } }), res as never)
-
-    expect(res.statusCode).toBe(409)
-    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
-    // No live snapshot fetch and no mis-schema-stamped board version row.
-    expect(fetchSpy).not.toHaveBeenCalled()
-    expect(createSpy).not.toHaveBeenCalled()
-
-    fetchSpy.mockRestore()
-    createSpy.mockRestore()
+  const rect = (id: string, index: string, x = 0) => ({
+    id,
+    type: 'rectangle',
+    index,
+    x,
+    y: 0,
+    width: 10,
+    height: 10,
+    version: 1,
+    versionNonce: 123,
   })
 
-  it('getVersionStateHandler rejects a board with 409 (no decode, no 200+empty)', async () => {
+  it('createVersionHandler snapshots a board and stamps WB_SCHEMA_VERSION', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
-    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+    vi.spyOn(persistence, 'fetch').mockResolvedValue(stateFromBoard([rect('e1', 'a0')]))
+    const createSpy = vi.spyOn(docVersionRepo, 'create').mockResolvedValue(42)
+
+    const res = mockRes()
+    await createVersionHandler(req({ docId: 'b_1' }, { body: { label: 'v1' } }), res as never)
+
+    expect(res.statusCode).toBe(201)
+    expect((res.body as { docVersionSeq: number }).docVersionSeq).toBe(42)
+    // The board version row is stamped on the whiteboard schema line, NOT the PM
+    // SCHEMA_VERSION — that is what lets the reader pick the right decoder later.
+    expect(createSpy.mock.calls[0]![0].schemaVersion).toBe(WB_SCHEMA_VERSION)
+
+    createSpy.mockRestore()
+    vi.mocked(persistence.fetch).mockRestore()
+  })
+
+  it('listVersionsHandler returns board versions (list is never gated by kind)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const listSpy = vi.spyOn(docVersionRepo, 'listByDoc').mockResolvedValue({
+      items: [
+        { id: 2, docId: 'b_1', documentName: 'octo:s1:f_default:wb:b_1', kind: 2, name: 'v2', restoredFrom: null, compressed: 1, sizeBytes: 10, schemaVersion: WB_SCHEMA_VERSION, createdAt: new Date(0), createdBy: 'u_1' },
+        { id: 1, docId: 'b_1', documentName: 'octo:s1:f_default:wb:b_1', kind: 1, name: '', restoredFrom: null, compressed: 1, sizeBytes: 8, schemaVersion: WB_SCHEMA_VERSION, createdAt: new Date(0), createdBy: 'u_1' },
+      ],
+      nextCursor: null,
+    })
+    const countsSpy = vi.spyOn(docVersionRepo, 'countsByKind').mockResolvedValue({ auto: 1, manual: 1, restore: 0, total: 2 })
+
+    const res = mockRes()
+    await listVersionsHandler(req({ docId: 'b_1' }, { query: { kind: 'all' } }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<{ docVersionSeq: number; schemaVersion: number }> }
+    expect(body.items.map((i) => i.docVersionSeq)).toEqual([2, 1])
+    expect(body.items.every((i) => i.schemaVersion === WB_SCHEMA_VERSION)).toBe(true)
+
+    listSpy.mockRestore()
+    countsSpy.mockRestore()
+  })
+
+  it('getVersionStateHandler returns an Excalidraw scene for a board (elements in index order)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    // Insert out of index order to prove the decode sorts by fractional index.
+    const state = stateFromBoard(
+      [rect('e2', 'a2', 20), rect('e1', 'a1', 10)],
+      { f1: { attachId: 'att_1', mimeType: 'image/png', status: 'ready', createdAt: 1 } },
+    )
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5,
+        docId: 'b_1',
+        documentName: 'octo:s1:f_default:wb:b_1',
+        kind: 2,
+        name: '',
+        restoredFrom: null,
+        compressed: 1,
+        sizeBytes: 2,
+        schemaVersion: WB_SCHEMA_VERSION,
+        createdAt: new Date(0),
+        createdBy: 'u_1',
+      } as never,
+      state,
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      kind: string
+      scene: { elements: Array<{ id: string }>; files: Record<string, unknown> }
+      schemaVersion: number
+      docVersionSeq: number
+    }
+    expect(body.kind).toBe('board')
+    expect(body.scene.elements.map((e) => e.id)).toEqual(['e1', 'e2'])
+    expect(body.scene.files.f1).toMatchObject({ attachId: 'att_1', status: 'ready' })
+    expect(body.schemaVersion).toBe(WB_SCHEMA_VERSION)
+    expect(body.docVersionSeq).toBe(5)
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('getVersionStateHandler 409s a board snapshot from a NEWER whiteboard schema', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5,
+        docId: 'b_1',
+        documentName: 'octo:s1:f_default:wb:b_1',
+        kind: 2,
+        name: '',
+        restoredFrom: null,
+        compressed: 1,
+        sizeBytes: 2,
+        // A board schema NEWER than this server's WB_SCHEMA_VERSION must be
+        // rejected — even though it is far below the PM SCHEMA_VERSION (delta #3).
+        schemaVersion: WB_SCHEMA_VERSION + 1,
+        createdAt: new Date(0),
+        createdBy: 'u_1',
+      } as never,
+      state: stateFromBoard([rect('e1', 'a1')]),
+    })
 
     const res = mockRes()
     await getVersionStateHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
 
     expect(res.statusCode).toBe(409)
-    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
-    // The gate short-circuits before the row is ever loaded/decoded.
-    expect(getStateSpy).not.toHaveBeenCalled()
+    expect((res.body as { error: string }).error).toBe('version_schema_newer')
 
     getStateSpy.mockRestore()
   })
 
-  it('restoreVersionHandler rejects a board with 409 (no safety snapshot, no live write/broadcast)', async () => {
+  it('restoreVersionHandler restores a board via the Excalidraw-scene live apply', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
-    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5,
+        docId: 'b_1',
+        documentName: 'octo:s1:f_default:wb:b_1',
+        kind: 2,
+        name: '',
+        restoredFrom: null,
+        compressed: 1,
+        sizeBytes: 2,
+        schemaVersion: WB_SCHEMA_VERSION,
+        createdAt: new Date(0),
+        createdBy: 'u_1',
+      } as never,
+      state: stateFromBoard([rect('e1', 'a1')]),
+    })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(99)
+    vi.mocked(transaction).mockImplementation(async (fn: never) => {
+      const tx = {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM yjs_document')) return []
+          if (sql.includes('FROM doc_meta')) return [{ owner_id: 'u_1', permission_epoch: 7, status: 1 }]
+          if (sql.includes('LAST_INSERT_ID')) return [{ id: 99 }]
+          return []
+        }),
+      }
+      return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
+    })
 
     const res = mockRes()
     await restoreVersionHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
 
-    expect(res.statusCode).toBe(409)
-    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
-    // restoreVersion never runs: no transaction (no safety-snapshot row), no
-    // live-document reconcile/broadcast.
-    expect(getStateSpy).not.toHaveBeenCalled()
-    expect(transaction).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ restoredFrom: 5, newDocVersionSeq: 99 })
+    // Board restore takes the Excalidraw-scene apply, NOT the ProseMirror one, and
+    // stamps the safety snapshot on the whiteboard schema line.
+    expect(applyBoardRestoreToLiveDoc).toHaveBeenCalledTimes(1)
     expect(applyRestoreToLiveDoc).not.toHaveBeenCalled()
+    expect(createSpy.mock.calls[0]![1].schemaVersion).toBe(WB_SCHEMA_VERSION)
 
-    getStateSpy.mockRestore()
+    createSpy.mockRestore()
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
   })
 
-  it('a rich-text doc (no board doc_type) is NOT gated — the guard is board-specific', async () => {
-    // Regression guard: the doc_type check must not affect ordinary documents.
+  it('a document is unaffected: create still stamps the PM SCHEMA_VERSION', async () => {
+    // Regression guard: the kind branch must not change the document path.
     vi.mocked(requireDocRole).mockResolvedValue({
       meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', permission_epoch: 7 },
       role: 'admin',
@@ -1102,9 +1256,76 @@ describe('version routes — whiteboard doc_type gate', () => {
     await createVersionHandler(req({ docId: 'd_1' }, { body: { label: 'ok' } }), res as never)
 
     expect(res.statusCode).toBe(201)
-    expect(createSpy).toHaveBeenCalledTimes(1)
+    expect(createSpy.mock.calls[0]![0].schemaVersion).toBe(SCHEMA_VERSION)
 
     createSpy.mockRestore()
     vi.mocked(persistence.fetch).mockRestore()
+  })
+})
+
+// ── kind-aware helpers (delta #3/#4): schema line + decode selection ───────────
+describe('version content kind (schema isolation)', () => {
+  it('contentKindFromDocType maps board vs everything else', () => {
+    expect(contentKindFromDocType('board')).toBe('board')
+    expect(contentKindFromDocType('doc')).toBe('document')
+    expect(contentKindFromDocType('sheet')).toBe('document')
+  })
+
+  it('currentSchemaVersionFor isolates the two schema lines', () => {
+    expect(currentSchemaVersionFor('board')).toBe(WB_SCHEMA_VERSION)
+    expect(currentSchemaVersionFor('document')).toBe(SCHEMA_VERSION)
+  })
+
+  it('gateSchemaForKind gates a board against WB_SCHEMA_VERSION, a document against SCHEMA_VERSION', () => {
+    // A version at WB_SCHEMA_VERSION+1 is newer for a board but far older for a doc.
+    expect(gateSchemaForKind(WB_SCHEMA_VERSION + 1, 'board').ok).toBe(false)
+    expect(gateSchemaForKind(WB_SCHEMA_VERSION + 1, 'document').ok).toBe(true)
+    expect(gateSchemaForKind(WB_SCHEMA_VERSION, 'board').ok).toBe(true)
+    expect(gateSchemaForKind(SCHEMA_VERSION + 1, 'document').ok).toBe(false)
+  })
+})
+
+// ── board scene decode + reconcile (pure helpers, delta #2) ───────────────────
+describe('board scene decode/reconcile', () => {
+  const rect = (id: string, index: string, x: number) => ({
+    id, type: 'rectangle', index, x, y: 0, width: 5, height: 5, version: 1, versionNonce: 1,
+  })
+
+  it('decodeBoardSnapshot reads elements (index-ordered) and files', () => {
+    const state = stateFromBoard(
+      [rect('b', 'a2', 2), rect('a', 'a1', 1)],
+      { f1: { attachId: 'x', mimeType: 'image/png', status: 'ready', createdAt: 0 } },
+    )
+    const scene = decodeBoardSnapshot(state)
+    expect(scene.elements.map((e) => e.id)).toEqual(['a', 'b'])
+    expect(scene.elements[0]).toMatchObject({ type: 'rectangle', x: 1 })
+    expect(scene.files.f1).toMatchObject({ attachId: 'x' })
+  })
+
+  it('restoreReconcileBoard makes the live board equal the target scene (union-safe)', () => {
+    // Live has e1(old) + e2; target has e1(new) + e3. Expect live -> {e1(new), e3}.
+    const live = stateFromBoard([rect('e1', 'a1', 1), rect('e2', 'a2', 2)])
+    const target = stateFromBoard([{ ...rect('e1', 'a1', 99) }, rect('e3', 'a3', 3)])
+
+    const out = restoreReconcileBoard(live, target)
+    const scene = decodeBoardSnapshot(out)
+    expect(scene.elements.map((e) => e.id).sort()).toEqual(['e1', 'e3'])
+    // e1 converged to the target's x; e2 was deleted; e3 was added.
+    const e1 = scene.elements.find((e) => e.id === 'e1')!
+    expect(e1.x).toBe(99)
+    expect(scene.elements.find((e) => e.id === 'e2')).toBeUndefined()
+  })
+
+  it('restoreReconcileBoard also reconciles the files map', () => {
+    const live = stateFromBoard([], { fOld: { attachId: 'old', mimeType: 'image/png', status: 'ready', createdAt: 0 } })
+    const target = stateFromBoard([], { fNew: { attachId: 'new', mimeType: 'image/png', status: 'ready', createdAt: 0 } })
+    const scene = decodeBoardSnapshot(restoreReconcileBoard(live, target))
+    expect(Object.keys(scene.files)).toEqual(['fNew'])
+  })
+
+  it('restoreReconcileBoard on two empty scenes is a no-op-shaped empty board', () => {
+    const scene = decodeBoardSnapshot(restoreReconcileBoard(stateFromBoard([]), stateFromBoard([])))
+    expect(scene.elements).toEqual([])
+    expect(scene.files).toEqual({})
   })
 })
