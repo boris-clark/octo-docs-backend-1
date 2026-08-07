@@ -1,0 +1,23 @@
+# Local MySQL 8 for the PPT relay integration suite (XIN-1740).
+#
+#   docker compose -f docker-compose.integration.yml up -d
+#   PPT_IT_MYSQL_PORT=33306 PPT_IT_MYSQL_USER=root PPT_IT_MYSQL_PASSWORD=rootpw \
+#     PPT_IT_MYSQL_DATABASE=ppt_relay_it npm run test:integration
+#   docker compose -f docker-compose.integration.yml down -v
+#
+# The suite drops/creates PPT_IT_MYSQL_DATABASE on setup, so it never touches an
+# operator's real database. See test/integration/README.md.
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: ppt_relay_it
+    ports:
+      - "33306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-prootpw"]
+      interval: 3s
+      timeout: 5s
+      retries: 20

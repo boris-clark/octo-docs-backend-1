@@ -1,0 +1,144 @@
+name: CI (PPT relay integration)
+
+# Surfaces real CI signal for the PPT relay/store path — INCLUDING on draft PRs.
+#
+# The main `ci.yml` gates (Build/Test/Typecheck/Lint) skip while a PR is Draft:
+#   if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && ...
+# so a PR that stays Draft for its whole review (like #162) never gets a real CI
+# run — every "green" is a local claim (XIN-1740 §B). This workflow deliberately
+# omits that draft guard and adds a MySQL 8 service container, so the relay/store
+# path is built, typechecked, linted, unit-tested AND exercised against a real
+# MySQL 8 while the PR is still Draft.
+#
+# It does NOT touch ci.yml and uses distinct job/check names, so it ADDS checks
+# without changing any existing required-status semantics, and it never marks a
+# PR ready or merges.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+    branches: [main]
+    paths:
+      - 'src/ppt/relay/**'
+      - 'src/db/**'
+      - 'migrations/**'
+      - 'test/integration/**'
+      - 'test/pptDbRelayStore.test.ts'
+      - 'vitest.config.ts'
+      - 'vitest.integration.config.ts'
+      - 'docker-compose.integration.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/ci-ppt-relay-integration.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/ppt/relay/**'
+      - 'src/db/**'
+      - 'migrations/**'
+      - 'test/integration/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  relay-build:
+    name: Relay Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  relay-typecheck:
+    name: Relay Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  relay-lint:
+    name: Relay Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  relay-unit:
+    name: Relay Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  relay-integration:
+    name: Relay Integration (real MySQL 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ppt_relay_it
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      PPT_IT_MYSQL_HOST: 127.0.0.1
+      PPT_IT_MYSQL_PORT: '3306'
+      PPT_IT_MYSQL_USER: root
+      PPT_IT_MYSQL_PASSWORD: root
+      PPT_IT_MYSQL_DATABASE: ppt_relay_it
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Wait for MySQL
+        run: |
+          for _ in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -proot --silent; then
+              echo "MySQL is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready" >&2; exit 1
+      - name: Integration tests (real MySQL)
+        run: npm run test:integration
